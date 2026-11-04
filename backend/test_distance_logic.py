@@ -4,12 +4,10 @@ from backend.app import _sanitize_route_distance
 
 
 class DistanceSanityTest(unittest.TestCase):
-    def test_very_long_route_is_reduced_to_conservative_estimate(self):
-        # A route that is far more than a reasonable road detour should not be
-        # accepted as the true road distance.
+    def test_implausible_route_is_rejected_instead_of_replaced_by_estimate(self):
+        # Do not convert an implausible router snap into a made-up road distance.
         distance = _sanitize_route_distance(17.0, 23.7)
-        self.assertLess(distance, 23.7)
-        self.assertAlmostEqual(distance, 22.1, places=1)
+        self.assertIsNone(distance)
 
     def test_normal_route_is_kept(self):
         distance = _sanitize_route_distance(17.0, 19.5)

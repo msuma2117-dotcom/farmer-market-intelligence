@@ -122,6 +122,11 @@ class NearbyMarketInput(AutoPredictionInput):
     location_district: str | None = None
 
 
+class ReverseGeocodeInput(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
+
 def get_graphhopper_key():
     """Read the key from the current process or Windows' saved user settings."""
     graphhopper_key = os.getenv("GRAPHHOPPER_API_KEY")
@@ -181,7 +186,7 @@ def _osrm_distance_km(latitude_1, longitude_1, latitude_2, longitude_2):
 
 
 def _sanitize_route_distance(straight_line_km: float, route_distance_km: float | None) -> float | None:
-    """Reject unrealistic detours that are much longer than the direct road path."""
+    """Reject implausible router snaps instead of presenting a guess as a route."""
     if route_distance_km is None:
         return None
 
@@ -190,12 +195,8 @@ def _sanitize_route_distance(straight_line_km: float, route_distance_km: float |
         return round(route_distance_km, 1)
 
     ratio = route_distance_km / straight_line_km
-    max_reasonable_ratio = 1.35
-    if ratio > max_reasonable_ratio:
-        # Avoid trusting router detours that are far beyond a sensible road
-        # geometry. In rural Karnataka, a 30-35% over-straight-line route is
-        # already a fairly large detour, so we prefer a conservative estimate.
-        return round(straight_line_km * 1.3, 1)
+    if ratio > 3:
+        return None
 
     return round(route_distance_km, 1)
 
@@ -227,9 +228,9 @@ def road_distance_km(latitude_1, longitude_1, latitude_2, longitude_2):
     if osrm_distance is not None and osrm_distance <= plausible_road_limit_km:
         return osrm_distance, "OSRM driving route"
 
-    # Keep the recommendation usable during routing outages, while telling the
-    # caller that this is an estimate rather than a measured driving route.
-    return round(straight_line_km * 1.3, 1), "Estimated road distance (1.3× straight-line)"
+    # Do not recommend a market using a straight-line multiplier presented as
+    # driving distance. Without a road route, this market cannot be ranked.
+    return None, "No verified driving route available"
 
 
 def build_market_features(crop_name: str, market_name: str, days_ahead: int):
@@ -355,6 +356,39 @@ def favicon():
 @app.get("/app")
 def frontend_app():
     return FileResponse(FRONTEND_INDEX, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/reverse-geocode")
+def reverse_geocode(data: ReverseGeocodeInput):
+    """Resolve coordinates to a locality through the backend."""
+    query = urlencode({
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "zoom": 18,
+        "lat": data.latitude,
+        "lon": data.longitude,
+    })
+    request = Request(
+        f"https://nominatim.openstreetmap.org/reverse?{query}",
+        headers={
+            "User-Agent": "AgriPulseFarmerMarketIntelligence/1.0 (location lookup)",
+            "Accept-Language": "kn,en",
+        },
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail="Could not look up this place name.") from error
+    address = result.get("address", {})
+    locality = next((address.get(key) for key in (
+        "village", "hamlet", "neighbourhood", "suburb", "town", "city", "county"
+    ) if address.get(key)), None)
+    district = address.get("state_district") or address.get("district")
+    named_place = result.get("name") or address.get("college") or address.get("university") or address.get("school")
+    parts = [part for part in (named_place, locality, district, address.get("state")) if part]
+    place_name = ", ".join(dict.fromkeys(parts)) or result.get("display_name") or "Place name unavailable"
+    return {"place_name": place_name}
 
 
 @app.get("/metadata")
@@ -840,7 +874,7 @@ def nearest_market_with_best_price(data: NearbyMarketInput):
         coordinates = MARKET_COORDINATES.get(market)
         print("MARKET:", market, "COORDINATES:", coordinates)
         if not coordinates:
-            return None
+            return {"market_name": market, "route_unavailable": True}
         try:
             features = build_market_features(data.crop_name, market, data.days_ahead)
         except HTTPException:
@@ -850,7 +884,7 @@ def nearest_market_with_best_price(data: NearbyMarketInput):
             data.latitude, data.longitude, coordinates[0], coordinates[1]
         )
         if distance_km is None:
-            return None
+            return {"market_name": market, "route_unavailable": True}
         print("VEHICLE DISTANCE:", market, distance_km, "SOURCE:", distance_source)
         quantity = data.quantity_quintals
         predicted_price = features["predicted_price"]
@@ -867,6 +901,11 @@ def nearest_market_with_best_price(data: NearbyMarketInput):
         )
         return {
             "market_name": market,
+            "google_maps_url": (
+                "https://www.google.com/maps/dir/?api=1"
+                f"&origin={data.latitude},{data.longitude}"
+                f"&destination={coordinates[0]},{coordinates[1]}&travelmode=driving"
+            ),
             "predicted_price": predicted_price,
             "forecast_series": features["forecast_series"],
             "distance_km": round(distance_km, 1),
@@ -882,7 +921,21 @@ def nearest_market_with_best_price(data: NearbyMarketInput):
     # Routing calls are independent, so do them concurrently instead of making
     # the user wait for one network request to finish before starting the next.
     with ThreadPoolExecutor(max_workers=6) as executor:
-        results = [result for result in executor.map(calculate_market, markets) if result]
+        route_results = [result for result in executor.map(calculate_market, markets) if result]
+
+    unavailable_markets = [
+        item["market_name"] for item in route_results if item.get("route_unavailable")
+    ]
+    if unavailable_markets:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not verify driving routes for "
+                f"{', '.join(unavailable_markets)}. No market recommendation was made; "
+                "retry later or check the routes in Google Maps."
+            ),
+        )
+    results = route_results
 
     filtered_results = [
         item for item in results
@@ -893,8 +946,8 @@ def nearest_market_with_best_price(data: NearbyMarketInput):
 
     if not filtered_results:
         raise HTTPException(
-            status_code=500,
-            detail="There is no nearest market for this location. Please choose a farm location closer to the market area or try a different crop.",
+            status_code=502,
+            detail="Driving routes are unavailable for this location. Try again, or choose and confirm your farm pin on the map.",
         )
 
     nearby_markets = sorted(filtered_results, key=lambda item: item["distance_km"])[:3]
